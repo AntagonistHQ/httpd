@@ -582,6 +582,7 @@ static int remoteip_modify_request(request_rec *r)
     remoteip_conn_config_t *conn_config = (remoteip_conn_config_t *)
         ap_get_module_config(r->connection->conn_config, &remoteip_module);
 
+    apr_table_t *env = r->subprocess_env;
     remoteip_req_t *req = NULL;
     apr_sockaddr_t *temp_sa;
 
@@ -624,6 +625,9 @@ static int remoteip_modify_request(request_rec *r)
 
         r->useragent_addr = conn_config->client_addr;
         r->useragent_ip = conn_config->client_ip;
+        if (remote_is_https(c)) {
+            apr_table_setn(env, "HTTPS", "on");
+        }
 
         ap_log_rerror(APLOG_MARK, APLOG_TRACE1, 0, r,
                       "Using %s as client's IP from PROXY protocol", r->useragent_ip);

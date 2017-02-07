@@ -191,6 +191,23 @@ static int remote_is_https(conn_rec *c)
     }
 }
 
+static const char *remoteip_http_scheme(const request_rec *r)
+{
+    if (remote_is_https(r->connection)) {
+        return "https";
+    }
+    return NULL;
+}
+
+static apr_port_t remoteip_default_port(const request_rec *r)
+{
+    if (remote_is_https(r->connection)) {
+        return 443;
+    }
+    return 0;
+}
+
+
 static void *create_remoteip_server_config(apr_pool_t *p, server_rec *s)
 {
     remoteip_config_t *config = apr_pcalloc(p, sizeof *config);
@@ -1379,6 +1396,8 @@ static void register_hooks(apr_pool_t *p)
     ap_hook_post_config(remoteip_hook_post_config, NULL, NULL, APR_HOOK_MIDDLE);
     ap_hook_pre_connection(remoteip_hook_pre_connection, NULL, NULL, APR_HOOK_MIDDLE);
     ap_hook_post_read_request(remoteip_modify_request, NULL, NULL, APR_HOOK_FIRST);
+    ap_hook_http_scheme(remoteip_http_scheme, NULL, NULL, APR_HOOK_FIRST);
+    ap_hook_default_port(remoteip_default_port, NULL, NULL, APR_HOOK_FIRST);
 
     APR_REGISTER_OPTIONAL_FN(remote_is_https);
 }

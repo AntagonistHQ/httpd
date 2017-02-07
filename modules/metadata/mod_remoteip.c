@@ -31,6 +31,7 @@
 #define APR_WANT_BYTEFUNC
 #include "apr_want.h"
 #include "apr_network_io.h"
+#include "mod_remoteip.h"
 
 module AP_MODULE_DECLARE_DATA remoteip_module;
 
@@ -76,6 +77,11 @@ typedef struct {
      */
     int pp_optional;
 
+    /*** Flag indicating if apache should treat the connection as ssl
+     * if remote says so
+     */
+    int use_remote_ssl;
+
     apr_pool_t *pool;
 } remoteip_config_t;
 
@@ -101,16 +107,19 @@ typedef union {
         uint32_t dst_addr;
         uint16_t src_port;
         uint16_t dst_port;
+        uint8_t data[508];
     } ip4;
     struct {        /* for TCP/UDP over IPv6, len = 36 */
-         uint8_t  src_addr[16];
-         uint8_t  dst_addr[16];
-         uint16_t src_port;
-         uint16_t dst_port;
+        uint8_t  src_addr[16];
+        uint8_t  dst_addr[16];
+        uint16_t src_port;
+        uint16_t dst_port;
+        uint8_t data[508];
     } ip6;
     struct {        /* for AF_UNIX sockets, len = 216 */
-         uint8_t src_addr[108];
-         uint8_t dst_addr[108];
+        uint8_t src_addr[108];
+        uint8_t dst_addr[108];
+        uint8_t data[508];
     } unx;
 } proxy_v2_addr;
 
@@ -126,6 +135,11 @@ typedef union {
         proxy_v1 v1;
         proxy_v2 v2;
 } proxy_header;
+
+typedef struct pp2_tlv {
+    uint8_t type;
+    uint16_t length;
+} pp2_tlv;
 
 static const char v2sig[12] = "\x0D\x0A\x0D\x0A\x00\x0D\x0A\x51\x55\x49\x54\x0A";
 #define MIN_V1_HDR_LEN 15
@@ -160,9 +174,29 @@ typedef struct {
     /** Flag indicating that the PROXY header may be omitted on this
       connection (do not abort if it is missing). */
     int proxy_protocol_optional;
+    /*** Flag indicating that remote connection used ssl */
+    int remoteip_is_ssl;
+
 } remoteip_conn_config_t;
 
 typedef enum { HDR_DONE, HDR_ERROR, HDR_MISSING, HDR_NEED_MORE } remoteip_parse_status_t;
+
+static int remote_is_https(conn_rec *c)
+{
+    remoteip_conn_config_t *conn_conf;
+    conn_conf = ap_get_module_config(c->conn_config, &remoteip_module);
+    if (conn_conf && conn_conf->remoteip_is_ssl) {
+        ap_log_cerror(APLOG_MARK, APLOG_DEBUG, 0, c,
+                  "ProxyProtocol: remote ssl on port %hu",
+                  c->local_addr->port);
+        return 1;
+    } else {
+        ap_log_cerror(APLOG_MARK, APLOG_DEBUG, 0, c,
+                  "ProxyProtocol: no remote ssl on port %hu",
+                  c->local_addr->port);
+        return 0;
+    }
+}
 
 static void *create_remoteip_server_config(apr_pool_t *p, server_rec *s)
 {
@@ -174,6 +208,7 @@ static void *create_remoteip_server_config(apr_pool_t *p, server_rec *s)
      * config->proxy_protocol_disabled = NULL;
      * config->pp_optional = 0;
      */
+    config->use_remote_ssl = 0;
     config->pool = p;
     config->secure_port = 443;
     return config;
@@ -208,6 +243,9 @@ static void *merge_remoteip_server_config(apr_pool_t *p, void *globalv,
     config->secure_port = server->secure_port
                                 ? server->secure_port
                                 : global->secure_port;
+    config->use_remote_ssl = server->use_remote_ssl
+                          ? server->use_remote_ssl
+                          : global->use_remote_ssl;
     return config;
 }
 
@@ -981,9 +1019,83 @@ static int remoteip_hook_pre_connection(conn_rec *c, void *csd)
     */
     conn_conf->proxy_protocol_optional = optional;
 
+    conn_conf->remoteip_is_ssl = 0;
+
     ap_set_module_config(c->conn_config, &remoteip_module, conn_conf);
 
     return OK;
+}
+
+/** Return length for a v2 protocol header. */
+static apr_size_t remoteip_get_v2_len(proxy_header *hdr)
+{
+    return ntohs(hdr->v2.len);
+}
+#define AVAIL_HEADER_SIZE(hsize, want) { \
+    if (hsize < want) { \
+        ap_log_cerror(APLOG_MARK, APLOG_DEBUG, 0, c, \
+			"RemoteIPProxyProtocol: invalid TLV header"); \
+        return; \
+    } \
+    hsize -= want; \
+    }
+
+#define PP2_TYPE_SSL            0x20
+#define PP2_SUBTYPE_SSL_VERSION 0x21
+#define PP2_SUBTYPE_SSL_CN      0x22
+
+#define PP2_CLIENT_SSL           0x01
+#define PP2_CLIENT_CERT_CONN     0x02
+#define PP2_CLIENT_CERT_SESS     0x04
+
+typedef struct pp2_tlv_ssl {
+    uint8_t  client;
+    uint32_t verify;
+} pp2_tlv_ssl;
+
+static void remoteip_process_v2_tlvs(conn_rec *c,
+                                              remoteip_conn_config_t *conn_conf,
+                                              uint8_t *data,
+					      apr_size_t data_size)
+{
+    pp2_tlv tlv;
+
+    while(data_size > 0) {
+        AVAIL_HEADER_SIZE(data_size, 3);
+        memcpy(&tlv.type, data, 1);
+        memcpy(&tlv.length, data +1, 2);
+        tlv.length = htons(tlv.length);
+        ap_log_cerror(APLOG_MARK, APLOG_DEBUG, 0, c,
+		    "RemoteIPProxyProtocol: tlv,  length %d, type %x", tlv.length, (unsigned)tlv.type);
+	data += 3;
+	if (tlv.type == PP2_TYPE_SSL) {
+            pp2_tlv_ssl tssl;
+	    if (tlv.length < 5) {
+		    ap_log_cerror(APLOG_MARK, APLOG_INFO, 0, c,
+				    "RemoteIPProxyProtocol: TLV SSL header size is invalid");
+		    continue;
+	    }
+	    tlv.length = 5;
+	    AVAIL_HEADER_SIZE(data_size, tlv.length);
+	    memcpy(&tssl.client, data, 1);
+	    memcpy(&tssl.verify, data + 1, 4);
+	    if (tssl.client & PP2_CLIENT_SSL) {
+		    ap_log_cerror(APLOG_MARK, APLOG_DEBUG, 0, c,
+				    "RemoteIPProxyProtocol: received SSL is enabled");
+		    conn_conf->remoteip_is_ssl = 1;
+	    }
+	} else if (tlv.type == PP2_SUBTYPE_SSL_VERSION) {
+		AVAIL_HEADER_SIZE(data_size, tlv.length);
+		char ssl_ver[tlv.length];
+		memcpy(&ssl_ver, data, tlv.length);
+		ap_log_cerror(APLOG_MARK, APLOG_DEBUG, 0, c,
+				"RemoteIPProxyProtocol: received SSL version %s", ssl_ver);
+        } else {
+            AVAIL_HEADER_SIZE(data_size, tlv.length);
+        }
+
+        data += tlv.length;
+    }
 }
 
 /* Binary format:
@@ -1001,6 +1113,10 @@ static remoteip_parse_status_t remoteip_process_v2_header(conn_rec *c,
                                               proxy_header *hdr)
 {
     apr_status_t ret;
+    static apr_size_t data_size;
+    remoteip_config_t *config = ap_get_module_config(ap_server_conf->module_config,
+                                                     &remoteip_module);
+    data_size = remoteip_get_v2_len(hdr);
 
     switch (hdr->v2.ver_cmd & 0xF) {
         case 0x01: /* PROXY command */
@@ -1019,6 +1135,7 @@ static remoteip_parse_status_t remoteip_process_v2_header(conn_rec *c,
 
                     conn_conf->client_addr->sa.sin.sin_addr.s_addr =
                             hdr->v2.addr.ip4.src_addr;
+		    data_size -= 12;
                     break;
 
                 case 0x21:  /* TCPv6 */
@@ -1035,6 +1152,7 @@ static remoteip_parse_status_t remoteip_process_v2_header(conn_rec *c,
                     }
                     memcpy(&conn_conf->client_addr->sa.sin6.sin6_addr.s6_addr,
                            hdr->v2.addr.ip6.src_addr, 16);
+		    data_size -= 36;
                     break;
 #else
                     ap_log_cerror(APLOG_MARK, APLOG_ERR, 0, c, APLOGNO(03506)
@@ -1068,13 +1186,11 @@ static remoteip_parse_status_t remoteip_process_v2_header(conn_rec *c,
         return HDR_ERROR;
     }
 
+    if (data_size > 0 && config->use_remote_ssl) {
+        /* we have extra data, let's see if it has SSL info */
+	remoteip_process_v2_tlvs(c, conn_conf, hdr->v2.addr.ip4.data, data_size);
+    }
     return HDR_DONE;
-}
-
-/** Return length for a v2 protocol header. */
-static apr_size_t remoteip_get_v2_len(proxy_header *hdr)
-{
-    return ntohs(hdr->v2.len);
 }
 
 /** Determine if this is a v1 or v2 PROXY header.
@@ -1097,6 +1213,16 @@ static int remoteip_determine_version(conn_rec *c, const char *ptr)
     }
 }
 
+static const char *remoteip_use_remote_ssl(cmd_parms *cmd,
+                                 void *dconf, int use_ssl_on)
+{
+    remoteip_config_t *config = ap_get_module_config(cmd->server->module_config,
+                                                     &remoteip_module);
+    config->use_remote_ssl = use_ssl_on;
+    return NULL;
+}
+
+
 /* Capture the first bytes on the protocol and parse the PROXY protocol header.
  * Removes itself when the header is complete.
  */
@@ -1113,6 +1239,7 @@ static apr_status_t remoteip_input_filter(ap_filter_t *f,
     remoteip_parse_status_t psts = HDR_NEED_MORE;
     const char *ptr;
     apr_size_t len;
+    apr_size_t data_done;
 
     if (f->c->aborted) {
         return APR_ECONNABORTED;
@@ -1219,6 +1346,7 @@ static apr_status_t remoteip_input_filter(ap_filter_t *f,
                         }
                         else if (ctx->version == 2) {
                             ctx->need = MIN_V2_HDR_LEN;
+			    data_done = MIN_V2_HDR_LEN;
                         }
                     }
                 }
@@ -1322,6 +1450,8 @@ static const command_rec remoteip_cmds[] =
                   "Default is \"SecureInidcatorSSLPort 443\" "),
     AP_INIT_TAKE1("RemoteIPProxyProtocol", remoteip_enable_proxy_protocol, NULL,
                   RSRC_CONF, "Enable PROXY protocol handling (`on', `off', `optional')"),
+    AP_INIT_FLAG("RemoteIPUseRemoteSSL", remoteip_use_remote_ssl, NULL, RSRC_CONF,
+                  "Specifies that conenction should be handled as SSL when remote says so"),
     { NULL }
 };
 
@@ -1339,6 +1469,8 @@ static void register_hooks(apr_pool_t *p)
     ap_hook_post_read_request(remoteip_modify_request, NULL, NULL, APR_HOOK_FIRST);
     ap_hook_http_scheme(remoteip_read_scheme, NULL, NULL, APR_HOOK_FIRST);
     ap_hook_default_port(remoteip_read_port, NULL, NULL, APR_HOOK_FIRST);
+
+    APR_REGISTER_OPTIONAL_FN(remote_is_https);
 }
 
 AP_DECLARE_MODULE(remoteip) = {

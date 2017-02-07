@@ -55,6 +55,13 @@ typedef struct {
      * from the proxy-via IP header value list)
      */
     const char *proxies_header_name;
+    /** A header that may indicate user is using a
+     * HTTPS connection to the reverse-proxy, and
+     * the value that it must match for it to do so.
+     */
+    const char *secure_header_name;
+    const char *secure_header_value;
+    unsigned short secure_port;
     /** A list of trusted proxies, ideally configured
      *  with the most commonly encountered listed first
      */
@@ -168,6 +175,7 @@ static void *create_remoteip_server_config(apr_pool_t *p, server_rec *s)
      * config->pp_optional = 0;
      */
     config->pool = p;
+    config->secure_port = 443;
     return config;
 }
 
@@ -191,6 +199,15 @@ static void *merge_remoteip_server_config(apr_pool_t *p, void *globalv,
     config->pp_optional = server->pp_optional
                           ? server->pp_optional
                           : global->pp_optional;
+    config->secure_header_name = server->secure_header_name
+                                ? server->secure_header_name
+                                : global->secure_header_name;
+    config->secure_header_value = server->secure_header_value
+                                ? server->secure_header_value
+                                : global->secure_header_value;
+    config->secure_port = server->secure_port
+                                ? server->secure_port
+                                : global->secure_port;
     return config;
 }
 
@@ -210,6 +227,35 @@ static const char *proxies_header_name_set(cmd_parms *cmd, void *dummy,
                                                      &remoteip_module);
     config->proxies_header_name = arg;
     return NULL;
+}
+
+static const char *secure_header_set(cmd_parms *cmd, void *dummy,
+                                           const char *name, const char *value)
+{
+    remoteip_config_t *config = ap_get_module_config(cmd->server->module_config,
+                                                     &remoteip_module);
+    if (!name || !value)
+        return "SecureIndicatorHeader requires header name and valid value";
+
+    config->secure_header_name = name;
+    config->secure_header_value = value;
+    return NULL;
+}
+
+static const char *secure_port_set(cmd_parms *cmd, void *dummy, const char *value)
+{
+    remoteip_config_t *config = ap_get_module_config(cmd->server->module_config,
+                                                     &remoteip_module);
+    if (value) {
+        char *tail;
+        int intval;
+        intval = apr_strtoi64(value, &tail, 0);
+        if (errno == 0 && *tail == '\0' && intval > 0 && intval < 65536) {
+            config->secure_port = (unsigned short) intval;
+            return NULL; /* no error */
+        }
+    }
+    return "SecureIndicatorSSLPort must be an integer between 0 and 65536";
 }
 
 /* Would be quite nice if APR exported this */
@@ -506,6 +552,7 @@ static int remoteip_modify_request(request_rec *r)
     char *proxy_ips = NULL;
     char *parse_remote;
     char *eos;
+    char *secure = NULL;
     unsigned char *addrbyte;
 
     /* If no RemoteIPInternalProxy, RemoteIPInternalProxyList, RemoteIPTrustedProxy
@@ -698,6 +745,21 @@ static int remoteip_modify_request(request_rec *r)
         return OK;
     }
 
+    if (config->secure_header_name) {
+        secure = (char *) apr_table_get(r->headers_in, config->secure_header_name);
+    }
+
+    if (secure) {
+        if (!strcmp(secure, config->secure_header_value)) {
+            apr_table_setn(r->subprocess_env, "HTTPS", "on");
+        }
+        /* Header is available. Unset even if no match. */
+        apr_table_unset(r->headers_in, config->secure_header_name);
+    }
+    else {
+        secure = NULL;
+    }
+
     /* Port is not known so set it to zero; otherwise it can be misleading */
     req->useragent_addr->port = 0;
 
@@ -724,11 +786,31 @@ static int remoteip_modify_request(request_rec *r)
 
     ap_log_rerror(APLOG_MARK, APLOG_TRACE1, 0, r,
                   req->proxy_ips
-                      ? "Using %s as client's IP by proxies %s"
-                      : "Using %s as client's IP by internal proxies%s",
+                      ? "Using %s as client's IP by %s proxies %s via"
+                      : "Using %s as client's IP by %s internal proxies %s",
                   req->useragent_ip,
+                  secure ? "HTTPS" : "HTTP",
                   (req->proxy_ips ? req->proxy_ips : ""));
     return OK;
+}
+
+static const char* remoteip_read_scheme(const request_rec *r)
+{
+    const char* secure = (const char *) apr_table_get(r->subprocess_env, "HTTPS");
+    if (secure && !strcmp(secure, "on"))
+        return "https";
+    return NULL;
+}
+
+static unsigned short remoteip_read_port(const request_rec *r)
+{
+    const char* secure = (const char *) apr_table_get(r->subprocess_env, "HTTPS");
+    if (secure && !strcmp(secure, "on")) {
+        remoteip_config_t *config = (remoteip_config_t *)
+            ap_get_module_config(r->server->module_config, &remoteip_module);
+        return config->secure_port;
+    }
+    return 0;
 }
 
 static int remoteip_is_server_port(apr_port_t port)
@@ -1232,6 +1314,12 @@ static const command_rec remoteip_cmds[] =
                   RSRC_CONF | EXEC_ON_READ,
                   "The filename to read the list of internal proxies, "
                   "see the RemoteIPInternalProxy directive"),
+    AP_INIT_TAKE2("SecureIndicatorHeader", secure_header_set, NULL, RSRC_CONF,
+                  "Specifies a request header and value that indicates a secure connection, "
+                  "e.g. \"X-Forwarded-Proto https\" or \"X-Secure-Connection on\""),
+    AP_INIT_TAKE1("SecureIndicatorSSLPort", secure_port_set, NULL, RSRC_CONF,
+                  "Port to be used for redirections if SecureIndicatorHeader is set, "
+                  "Default is \"SecureInidcatorSSLPort 443\" "),
     AP_INIT_TAKE1("RemoteIPProxyProtocol", remoteip_enable_proxy_protocol, NULL,
                   RSRC_CONF, "Enable PROXY protocol handling (`on', `off', `optional')"),
     { NULL }
@@ -1249,6 +1337,8 @@ static void register_hooks(apr_pool_t *p)
     ap_hook_post_config(remoteip_hook_post_config, NULL, NULL, APR_HOOK_MIDDLE);
     ap_hook_pre_connection(remoteip_hook_pre_connection, NULL, NULL, APR_HOOK_MIDDLE);
     ap_hook_post_read_request(remoteip_modify_request, NULL, NULL, APR_HOOK_FIRST);
+    ap_hook_http_scheme(remoteip_read_scheme, NULL, NULL, APR_HOOK_FIRST);
+    ap_hook_default_port(remoteip_read_port, NULL, NULL, APR_HOOK_FIRST);
 }
 
 AP_DECLARE_MODULE(remoteip) = {

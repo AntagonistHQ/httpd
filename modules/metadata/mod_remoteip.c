@@ -835,15 +835,15 @@ static int remoteip_modify_request(request_rec *r)
 static const char* remoteip_read_scheme(const request_rec *r)
 {
     const char* secure = (const char *) apr_table_get(r->subprocess_env, "HTTPS");
-    if (secure && !strcmp(secure, "on"))
+    if ((secure && !strcmp(secure, "on")) || remote_is_https(r->connection))
         return "https";
     return NULL;
 }
 
-static unsigned short remoteip_read_port(const request_rec *r)
+static apr_port_t remoteip_read_port(const request_rec *r)
 {
     const char* secure = (const char *) apr_table_get(r->subprocess_env, "HTTPS");
-    if (secure && !strcmp(secure, "on")) {
+    if ((secure && !strcmp(secure, "on")) || remote_is_https(r->connection)) {
         remoteip_config_t *config = (remoteip_config_t *)
             ap_get_module_config(r->server->module_config, &remoteip_module);
         return config->secure_port;

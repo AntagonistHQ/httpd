@@ -12,20 +12,26 @@
  * WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
  * See the License for the specific language governing permissions and
  * limitations under the License.
+ *
+ * Portions of the input filter code for PROXY protocol support is
+ * Copyright 2014 Cloudzilla Inc.
  */
 
 #include "ap_config.h"
 #include "ap_mmn.h"
+#include "ap_listen.h"
 #include "httpd.h"
 #include "http_config.h"
 #include "http_connection.h"
 #include "http_protocol.h"
 #include "http_log.h"
+#include "http_main.h"
 #include "apr_strings.h"
 #include "apr_lib.h"
 #define APR_WANT_BYTEFUNC
 #include "apr_want.h"
 #include "apr_network_io.h"
+#include "mod_remoteip.h"
 
 module AP_MODULE_DECLARE_DATA remoteip_module;
 
@@ -35,6 +41,12 @@ typedef struct {
     /** Flagged if internal, otherwise an external trusted proxy */
     void  *internal;
 } remoteip_proxymatch_t;
+
+typedef struct remoteip_addr_info {
+    struct remoteip_addr_info *next;
+    apr_sockaddr_t *addr;
+    server_rec *source;
+} remoteip_addr_info;
 
 typedef struct {
     /** The header to retrieve a proxy-via IP list */
@@ -48,6 +60,26 @@ typedef struct {
      *  with the most commonly encountered listed first
      */
     apr_array_header_t *proxymatch_ip;
+
+    remoteip_addr_info *proxy_protocol_enabled;
+    remoteip_addr_info *proxy_protocol_optional;
+    remoteip_addr_info *proxy_protocol_disabled;
+
+    /** A flag indicating whether or not proxyprotocol
+     * is optoinal for this specific server
+     */
+    int pp_optional;
+
+    /*** Flag indicating if apache should treat the connection as ssl
+     * if remote says so
+     */
+    int use_remote_ssl;
+
+    /*** port that is handled as an SSL-port by mod_rewrite
+     */
+    apr_port_t ssl_port;
+
+    apr_pool_t *pool;
 } remoteip_config_t;
 
 typedef struct {
@@ -59,12 +91,150 @@ typedef struct {
     const char *proxied_remote;
 } remoteip_req_t;
 
+/* For PROXY protocol processing */
+static ap_filter_rec_t *remoteip_filter;
+
+typedef struct {
+    char line[108];
+} proxy_v1;
+
+typedef union {
+    struct {        /* for TCP/UDP over IPv4, len = 12 */
+        uint32_t src_addr;
+        uint32_t dst_addr;
+        uint16_t src_port;
+        uint16_t dst_port;
+    } ip4;
+    struct {        /* for TCP/UDP over IPv6, len = 36 */
+         uint8_t  src_addr[16];
+         uint8_t  dst_addr[16];
+         uint16_t src_port;
+         uint16_t dst_port;
+    } ip6;
+    struct {        /* for AF_UNIX sockets, len = 216 */
+         uint8_t src_addr[108];
+         uint8_t dst_addr[108];
+    } unx;
+} proxy_v2_addr;
+
+typedef struct {
+    uint8_t  sig[12];  /* hex 0D 0A 0D 0A 00 0D 0A 51 55 49 54 0A */
+    uint8_t  ver_cmd;  /* protocol version and command */
+    uint8_t  fam;      /* protocol family and address */
+    uint16_t len;     /* number of following bytes part of the header */
+    proxy_v2_addr addr;
+} proxy_v2;
+
+typedef union {
+        proxy_v1 v1;
+        proxy_v2 v2;
+} proxy_header;
+
+typedef struct pp2_tlv {
+    uint8_t type;
+    uint8_t length_hi;
+    uint8_t length_lo;
+    uint8_t value[];
+} pp2_tlv;
+
+static const char v2sig[12] = "\x0D\x0A\x0D\x0A\x00\x0D\x0A\x51\x55\x49\x54\x0A";
+#define MIN_V1_HDR_LEN 15
+#define MIN_V2_HDR_LEN 16
+#define MIN_HDR_LEN MIN_V1_HDR_LEN
+
+/* XXX: Unsure if this is needed if v6 support is not available on
+   this platform */
+#ifndef INET6_ADDRSTRLEN
+#define INET6_ADDRSTRLEN 46
+#endif
+
+typedef struct {
+    char header[sizeof(proxy_header)];
+    apr_size_t rcvd;
+    apr_size_t need;
+    int version;
+    ap_input_mode_t mode;
+    apr_bucket_brigade *bb;
+    int peeking;
+    int done;
+} remoteip_filter_context;
+
+/** Holds the resolved proxy info for this connection and any addition
+  configurable parameters
+*/
+typedef struct {
+    /** The parsed client address in native format */
+    apr_sockaddr_t *client_addr;
+    /** Character representation of the client */
+    char *client_ip;
+    /** Flag indicating that the PROXY header may be omitted on this
+      connection (do not abort if it is missing). */
+    int proxy_protocol_optional;
+    /*** Flag indicating that remote connection used ssl */
+    int remoteip_is_ssl;
+
+} remoteip_conn_config_t;
+
+typedef enum { HDR_DONE, HDR_ERROR, HDR_MISSING, HDR_NEED_MORE } remoteip_parse_status_t;
+
+static int remote_is_https(conn_rec *c)
+{
+    remoteip_config_t *config;
+    remoteip_conn_config_t *conn_conf;
+    config = ap_get_module_config(ap_server_conf->module_config,
+                                &remoteip_module);
+    if (c->master != NULL) {
+        conn_conf = ap_get_module_config(c->master->conn_config, &remoteip_module);
+    } else {
+        conn_conf = ap_get_module_config(c->conn_config, &remoteip_module);
+    }
+    if (conn_conf && conn_conf->remoteip_is_ssl) {
+        ap_log_cerror(APLOG_MARK, APLOG_DEBUG, 0, c,
+                  "ProxyProtocol: remote ssl on port %hu",
+                  c->local_addr->port);
+        return 1;
+    } else if (c->local_addr->port == config->ssl_port) {
+        ap_log_cerror(APLOG_MARK, APLOG_DEBUG, 0, c,
+                  "ProxyProtocol: connected on sslport %hu",
+                  c->local_addr->port);
+        return 1;
+    } else {
+        ap_log_cerror(APLOG_MARK, APLOG_DEBUG, 0, c,
+                  "ProxyProtocol: no remote ssl on port %hu",
+                  c->local_addr->port);
+        return 0;
+    }
+}
+
+static const char *remoteip_http_scheme(const request_rec *r)
+{
+    if (remote_is_https(r->connection)) {
+        return "https";
+    }
+    return NULL;
+}
+
+static apr_port_t remoteip_default_port(const request_rec *r)
+{
+    if (remote_is_https(r->connection)) {
+        return 443;
+    }
+    return 0;
+}
+
+
 static void *create_remoteip_server_config(apr_pool_t *p, server_rec *s)
 {
     remoteip_config_t *config = apr_pcalloc(p, sizeof *config);
     /* config->header_name = NULL;
      * config->proxies_header_name = NULL;
+     * config->proxy_protocol_enabled = NULL;
+     * config->proxy_protocol_optional = NULL;
+     * config->proxy_protocol_disabled = NULL;
+     * config->pp_optional = 0;
      */
+    config->use_remote_ssl = 0;
+    config->pool = p;
     return config;
 }
 
@@ -85,6 +255,15 @@ static void *merge_remoteip_server_config(apr_pool_t *p, void *globalv,
     config->proxymatch_ip = server->proxymatch_ip
                           ? server->proxymatch_ip
                           : global->proxymatch_ip;
+    config->pp_optional = server->pp_optional
+                          ? server->pp_optional
+                          : global->pp_optional;
+    config->use_remote_ssl = server->use_remote_ssl
+                          ? server->use_remote_ssl
+                          : global->use_remote_ssl;
+    config->ssl_port = server->ssl_port
+                          ? server->ssl_port
+                          : global->ssl_port;
     return config;
 }
 
@@ -215,13 +394,189 @@ static const char *proxylist_read(cmd_parms *cmd, void *cfg,
     return NULL;
 }
 
+/** Similar apr_sockaddr_equal, except that it compares ports too. */
+static int remoteip_sockaddr_equal(apr_sockaddr_t *addr1, apr_sockaddr_t *addr2)
+{
+    return (addr1->port == addr2->port && apr_sockaddr_equal(addr1, addr2));
+}
+
+/** Similar remoteip_sockaddr_equal, except that it handles wildcard addresses
+ *  and ports too.
+ */
+static int remoteip_sockaddr_compat(apr_sockaddr_t *addr1, apr_sockaddr_t *addr2)
+{
+    /* test exact address equality */
+    if (apr_sockaddr_equal(addr1, addr2) &&
+        (addr1->port == addr2->port || addr1->port == 0 || addr2->port == 0)) {
+        return 1;
+    }
+
+    /* test address wildcards */
+    if (apr_sockaddr_is_wildcard(addr1) &&
+        (addr1->port == 0 || addr1->port == addr2->port)) {
+        return 1;
+    }
+
+    if (apr_sockaddr_is_wildcard(addr2) &&
+        (addr2->port == 0 || addr2->port == addr1->port)) {
+        return 1;
+    }
+
+    return 0;
+}
+
+static int remoteip_addr_in_list(remoteip_addr_info *list, apr_sockaddr_t *addr)
+{
+    for (; list; list = list->next) {
+        if (remoteip_sockaddr_compat(list->addr, addr)) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+static void remoteip_warn_enable_conflict(remoteip_addr_info *prev, server_rec *new, const char* arg)
+{
+    char buf[INET6_ADDRSTRLEN];
+
+    apr_sockaddr_ip_getbuf(buf, sizeof(buf), prev->addr);
+
+    ap_log_error(APLOG_MARK, APLOG_NOTICE, 0, new, APLOGNO(03491)
+                 "RemoteIPProxyProtocol: previous setting for %s:%hu from virtual "
+                 "host {%s:%hu in %s} is being overriden by virtual host "
+                 "{%s:%hu in %s}; new setting is '%s'",
+                 buf, prev->addr->port, prev->source->server_hostname,
+                 prev->source->addrs->host_port, prev->source->defn_name,
+                 new->server_hostname, new->addrs->host_port, new->defn_name,
+                 arg);
+}
+
+static const char *remoteip_enable_proxy_protocol(cmd_parms *cmd, void *config,
+                                                  const char *arg)
+{
+    remoteip_config_t *global_conf;
+    remoteip_config_t *server_conf;
+    server_addr_rec *addr;
+    remoteip_addr_info **add;
+    int list_len = 2;
+    remoteip_addr_info **rem_list[list_len];
+    remoteip_addr_info *list;
+    int i;
+
+    global_conf = ap_get_module_config(ap_server_conf->module_config,
+                                &remoteip_module);
+    server_conf = ap_get_module_config(cmd->server->module_config,
+                                &remoteip_module);
+
+    if (strcasecmp(arg, "On") == 0) {
+        add = &global_conf->proxy_protocol_enabled;
+        rem_list[0] = &global_conf->proxy_protocol_optional;
+        rem_list[1] = &global_conf->proxy_protocol_disabled;
+    }
+    else if (strcasecmp(arg, "Optional") == 0) {
+        add = &global_conf->proxy_protocol_optional;
+        rem_list[0] = &global_conf->proxy_protocol_enabled;
+        rem_list[1] = &global_conf->proxy_protocol_disabled;
+        server_conf->pp_optional = 1;
+    }
+    else if (strcasecmp(arg, "Off") == 0 ) {
+        add = &global_conf->proxy_protocol_disabled;
+        rem_list[0] = &global_conf->proxy_protocol_enabled;
+        rem_list[1] = &global_conf->proxy_protocol_optional;
+    }
+    else {
+        return apr_pstrcat(cmd->pool, "Unrecognized option for %s `%s'", cmd->cmd->name, arg, NULL);
+    }
+
+    for (addr = cmd->server->addrs; addr; addr = addr->next) {
+        /* remove address from other lists */
+        for (i = 0; i < list_len ; i++) { 
+            remoteip_addr_info **rem = rem_list[i];
+            if (*rem) {
+                if (remoteip_sockaddr_equal((*rem)->addr, addr->host_addr)) {
+                    remoteip_warn_enable_conflict(*rem, cmd->server, arg);
+                    *rem = (*rem)->next;
+                }
+                else {
+                    for (list = *rem; list->next; list = list->next) {
+                        if (remoteip_sockaddr_equal(list->next->addr, addr->host_addr)) {
+                            remoteip_warn_enable_conflict(list->next, cmd->server, arg);
+                            list->next = list->next->next;
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        /* add address to desired list */
+        if (!remoteip_addr_in_list(*add, addr->host_addr)) {
+            remoteip_addr_info *info = apr_palloc(global_conf->pool, sizeof(*info));
+            info->addr = addr->host_addr;
+            info->source = cmd->server;
+            info->next = *add;
+            *add = info;
+        }
+    }
+
+    return NULL;
+}
+
+static int remoteip_hook_pre_config(apr_pool_t *pconf, apr_pool_t *plog,
+                              apr_pool_t *ptemp)
+{
+    remoteip_config_t *config = (remoteip_config_t *)
+                                create_remoteip_server_config(pconf, NULL);
+    ap_set_module_config(ap_server_conf->module_config, &remoteip_module,
+                         config);
+
+    return OK;
+}
+
+static int remoteip_hook_post_config(apr_pool_t *pconf, apr_pool_t *plog,
+                               apr_pool_t *ptemp, server_rec *s)
+{
+    remoteip_config_t *conf;
+    remoteip_addr_info *info;
+    char buf[INET6_ADDRSTRLEN];
+
+    conf = ap_get_module_config(ap_server_conf->module_config,
+                                &remoteip_module);
+
+    for (info = conf->proxy_protocol_enabled; info; info = info->next) {
+        apr_sockaddr_ip_getbuf(buf, sizeof(buf), info->addr);
+        ap_log_error(APLOG_MARK, APLOG_NOTICE, 0, s, APLOGNO(03492)
+                     "RemoteIPProxyProtocol: enabled on %s:%hu", buf, info->addr->port);
+    }
+    for (info = conf->proxy_protocol_optional; info; info = info->next) {
+        apr_sockaddr_ip_getbuf(buf, sizeof(buf), info->addr);
+        ap_log_error(APLOG_MARK, APLOG_NOTICE, 0, s, APLOGNO(03493)
+                     "RemoteIPProxyProtocol: optional on %s:%hu", buf, info->addr->port);
+    }
+    for (info = conf->proxy_protocol_disabled; info; info = info->next) {
+        apr_sockaddr_ip_getbuf(buf, sizeof(buf), info->addr);
+        ap_log_error(APLOG_MARK, APLOG_NOTICE, 0, s, APLOGNO(03494)
+                     "RemoteIPProxyProtocol: disabled on %s:%hu", buf, info->addr->port);
+    }
+
+    return OK;
+}
+
 static int remoteip_modify_request(request_rec *r)
 {
     conn_rec *c = r->connection;
     remoteip_config_t *config = (remoteip_config_t *)
         ap_get_module_config(r->server->module_config, &remoteip_module);
-    remoteip_req_t *req = NULL;
+    remoteip_conn_config_t *conn_config;
+    if (c->master != NULL) {
+        conn_config = (remoteip_conn_config_t *) ap_get_module_config(c->master->conn_config, &remoteip_module);
+    } else {
+        conn_config = (remoteip_conn_config_t *) ap_get_module_config(c->conn_config, &remoteip_module);
+    }
 
+    apr_table_t *env = r->subprocess_env;
+    remoteip_req_t *req = NULL;
     apr_sockaddr_t *temp_sa;
 
     apr_status_t rv;
@@ -237,10 +592,40 @@ static int remoteip_modify_request(request_rec *r)
      */
     void *internal = NULL;
 
-    if (!config->header_name) {
+    /* No header defined or results from our input filter */
+    if (!config->header_name && !conn_config) {
         return DECLINED;
     }
  
+    /* Easy parsing case - just position the data we already have from PROXY
+       protocol handling allowing it to take precedence and return
+    */
+    if (conn_config) {
+        /* We may have gotten here if processing was optional - check for that */
+        if (!conn_config->client_addr) {
+            if (config->pp_optional) {
+                ap_log_rerror(APLOG_MARK, APLOG_DEBUG, 0, r, APLOGNO(03495)
+                              "RemoteIPProxyProtocol data is missing, but was optional. Allowing request.");
+                return OK;
+            }
+            else {
+                ap_log_rerror(APLOG_MARK, APLOG_WARNING, 0, r, APLOGNO(03496)
+                              "RemoteIPProxyProtocol data is missing, but required! Aborting request.");
+                return HTTP_BAD_REQUEST;
+            }
+        }
+
+        r->useragent_addr = conn_config->client_addr;
+        r->useragent_ip = conn_config->client_ip;
+        if (remote_is_https(c)) {
+            apr_table_setn(env, "HTTPS", "on");
+        }
+
+        ap_log_rerror(APLOG_MARK, APLOG_TRACE1, 0, r,
+                      "Using %s as client's IP from PROXY protocol", r->useragent_ip);
+        return OK;
+    }
+
     if (config->proxymatch_ip) {
         /* This indicates that a RemoteIPInternalProxy, RemoteIPInternalProxyList, RemoteIPTrustedProxy
            or RemoteIPTrustedProxyList directive is configured.
@@ -394,6 +779,9 @@ static int remoteip_modify_request(request_rec *r)
         return OK;
     }
 
+    /* Port is not known so set it to zero; otherwise it can be misleading */
+    req->useragent_addr->port = 0;
+
     req->proxied_remote = remote;
     req->proxy_ips = proxy_ips;
 
@@ -424,6 +812,586 @@ static int remoteip_modify_request(request_rec *r)
     return OK;
 }
 
+static int remoteip_is_server_port(apr_port_t port)
+{
+    ap_listen_rec *lr;
+
+    for (lr = ap_listeners; lr; lr = lr->next) {
+        if (lr->bind_addr && lr->bind_addr->port == port) {
+            return 1;
+        }
+    }
+
+    return 0;
+}
+
+/*
+ * Human readable format:
+ * PROXY {TCP4|TCP6|UNKNOWN} <client-ip-addr> <dest-ip-addr> <client-port> <dest-port><CR><LF>
+ */
+static remoteip_parse_status_t remoteip_process_v1_header(conn_rec *c,
+                                                          remoteip_conn_config_t *conn_conf,
+                                                          proxy_header *hdr, apr_size_t len,
+                                                          apr_size_t *hdr_len)
+{
+    char *end, *word, *host, *valid_addr_chars, *saveptr;
+    char buf[sizeof(hdr->v1.line)];
+    apr_port_t port;
+    apr_status_t ret;
+    apr_int32_t family;
+
+#define GET_NEXT_WORD(field) \
+    word = apr_strtok(NULL, " ", &saveptr); \
+    if (!word) { \
+        ap_log_cerror(APLOG_MARK, APLOG_ERR, 0, c, APLOGNO(03497) \
+                      "RemoteIPProxyProtocol: no " field " found in header '%s'", \
+                      hdr->v1.line); \
+        return HDR_ERROR; \
+    }
+
+    end = memchr(hdr->v1.line, '\r', len - 1);
+    if (!end || end[1] != '\n') {
+        return HDR_NEED_MORE; /* partial or invalid header */
+    }
+
+    *end = '\0';
+    *hdr_len = end + 2 - hdr->v1.line; /* skip header + CRLF */
+
+    /* parse in separate buffer so have the original for error messages */
+    strcpy(buf, hdr->v1.line);
+
+    apr_strtok(buf, " ", &saveptr);
+
+    /* parse family */
+    GET_NEXT_WORD("family")
+    if (strcmp(word, "UNKNOWN") == 0) {
+        conn_conf->client_addr = c->client_addr;
+        conn_conf->client_ip = c->client_ip;
+        return HDR_DONE;
+    }
+    else if (strcmp(word, "TCP4") == 0) {
+        family = APR_INET;
+        valid_addr_chars = "0123456789.";
+    }
+    else if (strcmp(word, "TCP6") == 0) {
+#if APR_HAVE_IPV6
+        family = APR_INET6;
+        valid_addr_chars = "0123456789abcdefABCDEF:";
+#else
+        ap_log_cerror(APLOG_MARK, APLOG_ERR, 0, c, APLOGNO(03498)
+                      "RemoteIPProxyProtocol: Unable to parse v6 address - APR is not compiled with IPv6 support",
+                      word, hdr->v1.line);
+        return HDR_ERROR;
+#endif
+    }
+    else {
+        ap_log_cerror(APLOG_MARK, APLOG_ERR, 0, c, APLOGNO(03499)
+                      "RemoteIPProxyProtocol: unknown family '%s' in header '%s'",
+                      word, hdr->v1.line);
+        return HDR_ERROR;
+    }
+
+    /* parse client-addr */
+    GET_NEXT_WORD("client-address")
+
+    if (strspn(word, valid_addr_chars) != strlen(word)) {
+        ap_log_cerror(APLOG_MARK, APLOG_ERR, 0, c, APLOGNO(03500)
+                      "RemoteIPProxyProtocol: invalid client-address '%s' found in "
+                      "header '%s'", word, hdr->v1.line);
+        return HDR_ERROR;
+    }
+
+    host = word;
+
+    /* parse dest-addr */
+    GET_NEXT_WORD("destination-address")
+
+    /* parse client-port */
+    GET_NEXT_WORD("client-port")
+    if (sscanf(word, "%hu", &port) != 1) {
+        ap_log_cerror(APLOG_MARK, APLOG_ERR, 0, c, APLOGNO(03501)
+                      "RemoteIPProxyProtocol: error parsing port '%s' in header '%s'",
+                      word, hdr->v1.line);
+        return HDR_ERROR;
+    }
+
+    /* parse dest-port */
+    /* GET_NEXT_WORD("destination-port") - no-op since we don't care about it */
+
+    /* create a socketaddr from the info */
+    ret = apr_sockaddr_info_get(&conn_conf->client_addr, host, family, port, 0,
+                                c->pool);
+    if (ret != APR_SUCCESS) {
+        conn_conf->client_addr = NULL;
+        ap_log_cerror(APLOG_MARK, APLOG_ERR, ret, c, APLOGNO(03502)
+                      "RemoteIPProxyProtocol: error converting family '%d', host '%s',"
+                      " and port '%hu' to sockaddr; header was '%s'",
+                      family, host, port, hdr->v1.line);
+        return HDR_ERROR;
+    }
+
+    conn_conf->client_ip = apr_pstrdup(c->pool, host);
+
+    return HDR_DONE;
+}
+
+/** Add our filter to the connection if it is requested
+ */
+static int remoteip_hook_pre_connection(conn_rec *c, void *csd)
+{
+    remoteip_config_t *conf;
+    remoteip_conn_config_t *conn_conf;
+    int optional;
+
+    if (c->master != NULL) {
+        return DECLINED;
+    }
+
+    conf = ap_get_module_config(ap_server_conf->module_config,
+                                &remoteip_module);
+
+    /* Used twice - do the check only once */
+    optional = remoteip_addr_in_list(conf->proxy_protocol_optional, c->local_addr);
+
+    /* check if we're enabled for this connection */
+    if ((!remoteip_addr_in_list(conf->proxy_protocol_enabled, c->local_addr)
+          && !optional )
+        || remoteip_addr_in_list(conf->proxy_protocol_disabled, c->local_addr)) {
+        return DECLINED;
+    }
+
+    /* mod_proxy creates outgoing connections - we don't want those */
+    if (!remoteip_is_server_port(c->local_addr->port)) {
+        return DECLINED;
+    }
+
+    /* add our filter */
+    if (!ap_add_input_filter_handle(remoteip_filter, NULL, NULL, c)) {
+        /* XXX: Shouldn't this WARN in log? */
+        return DECLINED;
+    }
+
+    ap_log_cerror(APLOG_MARK, APLOG_DEBUG, 0, c, APLOGNO(03503)
+                  "RemoteIPProxyProtocol: enabled on connection to %s:%hu",
+                  c->local_ip, c->local_addr->port);
+
+    /* this holds the resolved proxy info for this connection */
+    conn_conf = apr_pcalloc(c->pool, sizeof(*conn_conf));
+
+    /* Propagate the optional flag so the connection handler knows not to
+       abort if the header is mising. NOTE: This means we must check after
+       we read the request that the header was NOT optional, too.
+    */
+    conn_conf->proxy_protocol_optional = optional;
+    conn_conf->remoteip_is_ssl = 0;
+
+    ap_set_module_config(c->conn_config, &remoteip_module, conn_conf);
+
+    return OK;
+}
+
+#define AVAIL_HEADER_SIZE(hsize, want) { \
+    if (hsize < want) { \
+        ap_log_cerror(APLOG_MARK, APLOG_DEBUG, 0, c, \
+			"RemoteIPProxyProtocol: invalid TLV header"); \
+        return; \
+    } \
+    hsize -= want; \
+    }
+
+#define PP2_TYPE_SSL            0x20
+#define PP2_SUBTYPE_SSL_VERSION 0x21
+#define PP2_SUBTYPE_SSL_CN      0x22
+
+#define PP2_CLIENT_SSL           0x01
+#define PP2_CLIENT_CERT_CONN     0x02
+#define PP2_CLIENT_CERT_SESS     0x04
+
+typedef struct pp2_tlv_ssl {
+    uint8_t  client;
+    uint32_t verify;
+} pp2_tlv_ssl;
+
+/** Return length for a v2 protocol header. */
+static int remoteip_get_v2_len(proxy_header *hdr)
+{
+    return ntohs(hdr->v2.len);
+}
+
+/*
+ * Get data length from tlv
+ */
+static int get_tlv_length(const struct pp2_tlv *src)
+{
+    return (src->length_hi << 8) | src->length_lo;
+}
+
+/* Binary format:
+ * <sig><cmd><proto><addr-len><addr>
+ * sig = \x0D \x0A \x0D \x0A \x00 \x0D \x0A \x51 \x55 \x49 \x54 \x0A
+ * cmd = <4-bits-version><4-bits-command>
+ * 4-bits-version = \x02
+ * 4-bits-command = {\x00|\x01}  (\x00 = LOCAL: discard con info; \x01 = PROXY)
+ * proto = <4-bits-family><4-bits-protocol>
+ * 4-bits-family = {\x00|\x01|\x02|\x03}  (AF_UNSPEC, AF_INET, AF_INET6, AF_UNIX)
+ * 4-bits-protocol = {\x00|\x01|\x02}  (UNSPEC, STREAM, DGRAM)
+ */
+static remoteip_parse_status_t remoteip_process_v2_header(conn_rec *c,
+                                              remoteip_conn_config_t *conn_conf,
+                                              const char *ptr, apr_size_t len)
+{
+    proxy_header *hdr = (proxy_header *) ptr;
+    apr_status_t ret;
+    int tlv_length = 0;
+    int tlv_offset = 0;
+    remoteip_config_t *config = ap_get_module_config(ap_server_conf->module_config,
+                                                     &remoteip_module);
+    ap_log_cerror(APLOG_MARK, APLOG_DEBUG, 0, c,
+               "RemoteIPProxyProtocol: data_size, %d" , remoteip_get_v2_len(hdr));
+
+    switch (hdr->v2.ver_cmd & 0xF) {
+        case 0x01: /* PROXY command */
+            switch (hdr->v2.fam) {
+                case 0x11:  /* TCPv4 */
+                    ret = apr_sockaddr_info_get(&conn_conf->client_addr, NULL,
+                                                APR_INET,
+                                                ntohs(hdr->v2.addr.ip4.src_port),
+                                                0, c->pool);
+                    if (ret != APR_SUCCESS) {
+                        conn_conf->client_addr = NULL;
+                        ap_log_cerror(APLOG_MARK, APLOG_ERR, ret, c, APLOGNO(03504)
+                                      "RemoteIPPProxyProtocol: error creating sockaddr");
+                        return HDR_ERROR;
+                    }
+
+                    conn_conf->client_addr->sa.sin.sin_addr.s_addr =
+                            hdr->v2.addr.ip4.src_addr;
+                    tlv_offset = MIN_V2_HDR_LEN + 12;
+                    tlv_length = remoteip_get_v2_len(hdr) - 12;
+                    break;
+
+                case 0x21:  /* TCPv6 */
+#if APR_HAVE_IPV6
+                    ret = apr_sockaddr_info_get(&conn_conf->client_addr, NULL,
+                                                APR_INET6,
+                                                ntohs(hdr->v2.addr.ip6.src_port),
+                                                0, c->pool);
+                    if (ret != APR_SUCCESS) {
+                        conn_conf->client_addr = NULL;
+                        ap_log_cerror(APLOG_MARK, APLOG_ERR, ret, c, APLOGNO(03505)
+                                      "RemoteIPProxyProtocol: error creating sockaddr");
+                        return HDR_ERROR;
+                    }
+                    memcpy(&conn_conf->client_addr->sa.sin6.sin6_addr.s6_addr,
+                           hdr->v2.addr.ip6.src_addr, 16);
+                    tlv_offset = MIN_V2_HDR_LEN + 36;
+                    tlv_length = remoteip_get_v2_len(hdr) - 36;
+                    break;
+#else
+                    ap_log_cerror(APLOG_MARK, APLOG_ERR, 0, c, APLOGNO(03506)
+                                  "RemoteIPProxyProtocol: APR is not compiled with IPv6 support");
+                    return HDR_ERROR;
+#endif
+                default:
+                    /* unsupported protocol, keep local connection address */
+                    return HDR_DONE;
+            }
+            break;  /* we got a sockaddr now */
+
+        case 0x00: /* LOCAL command */
+            /* keep local connection address for LOCAL */
+            return HDR_DONE;
+
+        default:
+            /* not a supported command */
+            ap_log_cerror(APLOG_MARK, APLOG_ERR, 0, c, APLOGNO(03507)
+                          "RemoteIPProxyProtocol: unsupported command %.2hx",
+                          (unsigned short)hdr->v2.ver_cmd);
+            return HDR_ERROR;
+    }
+
+    /* got address - compute the client_ip from it */
+    ret = apr_sockaddr_ip_get(&conn_conf->client_ip, conn_conf->client_addr);
+    if (ret != APR_SUCCESS) {
+        conn_conf->client_addr = NULL;
+        ap_log_cerror(APLOG_MARK, APLOG_ERR, ret, c, APLOGNO(03508)
+                      "RemoteIPProxyProtocol: error converting address to string");
+        return HDR_ERROR;
+    }
+
+    if (tlv_length > 0 && config->use_remote_ssl) {
+        /* we have extra data, let's see if it has SSL info */
+        while (tlv_offset + 3  <= len) {
+            const struct pp2_tlv *tlv_packet = (struct pp2_tlv *) &ptr[tlv_offset];
+            const int tlv_len = get_tlv_length(tlv_packet);
+            tlv_offset += tlv_len + 3;
+
+            ap_log_cerror(APLOG_MARK, APLOG_DEBUG, 0, c,
+		    "RemoteIPProxyProtocol: tlv,  length %d, type %x", tlv_len, (unsigned)tlv_packet->type);
+            if (tlv_packet->type == PP2_TYPE_SSL) {
+                pp2_tlv_ssl tssl;
+                if (tlv_len < 5) {
+                    ap_log_cerror(APLOG_MARK, APLOG_INFO, 0, c,
+                        "RemoteIPProxyProtocol: TLV SSL header size is invalid");
+                    continue;
+                }
+                memcpy(&tssl.client, tlv_packet->value, 1);
+                memcpy(&tssl.verify, tlv_packet->value + 1, 4);
+                if (tssl.client & PP2_CLIENT_SSL) {
+                    ap_log_cerror(APLOG_MARK, APLOG_DEBUG, 0, c,
+                        "RemoteIPProxyProtocol: received SSL is enabled");
+                    conn_conf->remoteip_is_ssl = 1;
+                }
+                tlv_offset -= tlv_len - 5;
+            } else if (tlv_packet->type == PP2_SUBTYPE_SSL_VERSION) {
+                char ssl_ver[tlv_len];
+                memcpy(&ssl_ver, tlv_packet->value, tlv_len);
+                ap_log_cerror(APLOG_MARK, APLOG_DEBUG, 0, c,
+                    "RemoteIPProxyProtocol: received SSL version %s", ssl_ver);
+            }
+        }
+    }
+
+    return HDR_DONE;
+}
+
+/** Determine if this is a v1 or v2 PROXY header.
+ */
+static int remoteip_determine_version(conn_rec *c, const char *ptr)
+{
+    proxy_header *hdr = (proxy_header *) ptr;
+
+    /* assert len >= 14 */
+
+    if (memcmp(&hdr->v2, v2sig, sizeof(v2sig)) == 0 &&
+        (hdr->v2.ver_cmd & 0xF0) == 0x20) {
+        return 2;
+    }
+    else if (memcmp(hdr->v1.line, "PROXY ", 6) == 0) {
+        return 1;
+    }
+    else {
+        return -1;
+    }
+}
+
+static const char *remoteip_ssl_port(cmd_parms *cmd,
+                                 void *dconf, const char *port)
+{
+    remoteip_config_t *config = ap_get_module_config(cmd->server->module_config,
+                                                     &remoteip_module);
+
+    config->ssl_port = atoi(port);
+
+    if (!config->ssl_port)
+        return "ProxyProtocolSSLPort must be numeric";
+
+    return NULL;
+}
+
+static const char *remoteip_use_remote_ssl(cmd_parms *cmd,
+                                 void *dconf, int use_ssl_on)
+{
+    remoteip_config_t *config = ap_get_module_config(cmd->server->module_config,
+                                                     &remoteip_module);
+    config->use_remote_ssl = use_ssl_on;
+    return NULL;
+}
+
+
+/* Capture the first bytes on the protocol and parse the PROXY protocol header.
+ * Removes itself when the header is complete.
+ */
+static apr_status_t remoteip_input_filter(ap_filter_t *f,
+                                    apr_bucket_brigade *bb_out,
+                                    ap_input_mode_t mode,
+                                    apr_read_type_e block,
+                                    apr_off_t readbytes)
+{
+    apr_status_t ret;
+    remoteip_filter_context *ctx = f->ctx;
+    remoteip_conn_config_t *conn_conf;
+    apr_bucket *b;
+    remoteip_parse_status_t psts = HDR_NEED_MORE;
+    const char *ptr;
+    apr_size_t len;
+
+    if (f->c->aborted) {
+        return APR_ECONNABORTED;
+    }
+
+    conn_conf = ap_get_module_config(f->c->conn_config, &remoteip_module);
+
+    /* allocate/retrieve the context that holds our header */
+    if (!ctx) {
+        ctx = f->ctx = apr_palloc(f->c->pool, sizeof(*ctx));
+        ctx->rcvd = 0;
+        ctx->need = MIN_HDR_LEN;
+        ctx->version = 0;
+        ctx->bb = apr_brigade_create(f->c->pool, f->c->bucket_alloc);
+        ctx->done = 0;
+        if (conn_conf->proxy_protocol_optional) {
+            ctx->mode = AP_MODE_SPECULATIVE;
+            ctx->peeking = 1;
+        }
+        else {
+            ctx->mode = AP_MODE_READBYTES;
+            ctx->peeking = 0;
+        }
+    }
+
+    if (ctx->done) {
+        /* Note: because we're a connection filter we can't remove ourselves
+         * when we're done, so we have to stay in the chain and just go into
+         * passthrough mode.
+         */
+        return ap_get_brigade(f->next, bb_out, mode, block, readbytes);
+    }
+
+    /* try to read a header's worth of data */
+    while (!ctx->done) {
+        if (APR_BRIGADE_EMPTY(ctx->bb)) {
+            ret = ap_get_brigade(f->next, ctx->bb, ctx->mode, block,
+                                 ctx->need - ctx->rcvd);
+            if (ret != APR_SUCCESS) {
+                return ret;
+            }
+        }
+        if (APR_BRIGADE_EMPTY(ctx->bb)) {
+            return block == APR_NONBLOCK_READ ? APR_SUCCESS : APR_EOF;
+        }
+
+        while (!ctx->done && !APR_BRIGADE_EMPTY(ctx->bb)) {
+            b = APR_BRIGADE_FIRST(ctx->bb);
+
+            ret = apr_bucket_read(b, &ptr, &len, block);
+            if (APR_STATUS_IS_EAGAIN(ret) && block == APR_NONBLOCK_READ) {
+                return APR_SUCCESS;
+            }
+            if (ret != APR_SUCCESS) {
+                return ret;
+            }
+
+            memcpy(ctx->header + ctx->rcvd, ptr, len);
+            ctx->rcvd += len;
+
+            apr_bucket_delete(b);
+            psts = HDR_NEED_MORE;
+
+            if (ctx->version == 0) {
+                /* reading initial chunk */
+                if (ctx->rcvd >= MIN_HDR_LEN) {
+                    ctx->version = remoteip_determine_version(f->c, ctx->header);
+
+                    /* We've read enough to know that a header is present. In peek mode
+                       we purge the bb and can decide to step aside or switch to
+                       non-speculative read to consume the data */
+                    if (ctx->peeking) {
+                        apr_brigade_destroy(ctx->bb);
+
+                        if (ctx->version < 0) {
+                            ap_log_cerror(APLOG_MARK, APLOG_DEBUG, 0, f->c, APLOGNO(03512)
+                                          "RemoteIPProxyProtocol: PROXY header is missing from "
+                                          "request. Stepping aside.");
+                            ctx->bb = NULL;
+                            ctx->done = 1;
+                            return ap_get_brigade(f->next, bb_out, mode, block, readbytes);
+                        }
+                        else {
+                            /* Rest ctx to initial values */
+                            ctx->rcvd = 0;
+                            ctx->need = MIN_HDR_LEN;
+                            ctx->version = 0;
+                            ctx->bb = apr_brigade_create(f->c->pool, f->c->bucket_alloc);
+                            ctx->done = 0;
+                            ctx->mode = AP_MODE_READBYTES;
+                            ctx->peeking = 0;
+
+                            ap_get_brigade(f->next, ctx->bb, ctx->mode, block,
+                                           ctx->need - ctx->rcvd);
+                        }
+                    }
+                    else {
+                        if (ctx->version < 0) {
+                            psts = HDR_MISSING;
+                        }
+                        else if (ctx->version == 1) {
+                            ctx->mode = AP_MODE_GETLINE;
+                            ctx->need = sizeof(proxy_v1);
+                        }
+                        else if (ctx->version == 2) {
+                            ctx->need = MIN_V2_HDR_LEN;
+                        }
+                    }
+                }
+            }
+            else if (ctx->version == 1) {
+                psts = remoteip_process_v1_header(f->c, conn_conf,
+                                            (proxy_header *) ctx->header,
+                                            ctx->rcvd, &ctx->need);
+            }
+            else if (ctx->version == 2) {
+                if (ctx->rcvd >= MIN_V2_HDR_LEN) {
+                    ctx->need = MIN_V2_HDR_LEN +
+                        remoteip_get_v2_len((proxy_header *) ctx->header);
+
+                }
+                if (ctx->rcvd >= ctx->need) {
+                    psts = remoteip_process_v2_header(f->c, conn_conf, ctx->header, ctx->rcvd);
+                }
+            }
+            else {
+                ap_log_cerror(APLOG_MARK, APLOG_ERR, 0, f->c, APLOGNO(03509)
+                              "RemoteIPProxyProtocol: internal error: unknown version "
+                              "%d", ctx->version);
+                f->c->aborted = 1;
+                apr_brigade_destroy(ctx->bb);
+                return APR_ECONNABORTED;
+            }
+
+            switch (psts) {
+                case HDR_MISSING:
+                    ap_log_cerror(APLOG_MARK, APLOG_ERR, 0, f->c, APLOGNO(03510)
+                                 "RemoteIPProxyProtocol: no valid PROXY header found");
+                        /* fall through to error case */
+                case HDR_ERROR:
+                    f->c->aborted = 1;
+                    apr_brigade_destroy(ctx->bb);
+                    return APR_ECONNABORTED;
+
+                case HDR_DONE:
+                    ctx->done = 1;
+                    break;
+
+                case HDR_NEED_MORE:
+                    break;
+            }
+        }
+    }
+
+    /* we only get here when done == 1 */
+    ap_log_cerror(APLOG_MARK, APLOG_DEBUG, 0, f->c, APLOGNO(03511)
+                  "RemoteIPProxyProtocol: received valid PROXY header: %s:%hu",
+                  conn_conf->client_ip, conn_conf->client_addr->port);
+
+    if (ctx->rcvd > ctx->need || !APR_BRIGADE_EMPTY(ctx->bb)) {
+        ap_log_cerror(APLOG_MARK, APLOG_ERR, 0, f->c, APLOGNO(03513)
+                      "RemoteIPProxyProtocol: internal error: have data left over; "
+                      " need=%lu, rcvd=%lu, brigade-empty=%d", ctx->need,
+                      ctx->rcvd, APR_BRIGADE_EMPTY(ctx->bb));
+        f->c->aborted = 1;
+        apr_brigade_destroy(ctx->bb);
+        return APR_ECONNABORTED;
+    }
+
+    /* clean up */
+    apr_brigade_destroy(ctx->bb);
+    ctx->bb = NULL;
+
+    /* now do the real read for the upper layer */
+    return ap_get_brigade(f->next, bb_out, mode, block, readbytes);
+}
+
 static const command_rec remoteip_cmds[] =
 {
     AP_INIT_TAKE1("RemoteIPHeader", header_name_set, NULL, RSRC_CONF,
@@ -447,12 +1415,34 @@ static const command_rec remoteip_cmds[] =
                   RSRC_CONF | EXEC_ON_READ,
                   "The filename to read the list of internal proxies, "
                   "see the RemoteIPInternalProxy directive"),
+    AP_INIT_TAKE1("RemoteIPProxyProtocol", remoteip_enable_proxy_protocol, NULL,
+                  RSRC_CONF, "Enable PROXY protocol handling (`on', `off', `optional')"),
+    AP_INIT_TAKE1("RemoteIPSSLPort", remoteip_ssl_port, NULL, RSRC_CONF,
+                  "Listen port that assumes SSL is on for mod_rewrite"),
+    AP_INIT_FLAG("RemoteIPUseRemoteSSL", remoteip_use_remote_ssl, NULL, RSRC_CONF,
+                  "Specifies that conenction should be handled as SSL when remote says so"),
+
     { NULL }
 };
 
+
+
 static void register_hooks(apr_pool_t *p)
 {
+    /* mod_ssl is CONNECTION + 5, so we want something higher (earlier);
+     * mod_reqtimeout is CONNECTION + 8, so we want something lower (later) */
+    remoteip_filter = 
+        ap_register_input_filter("REMOTEIP_INPUT", remoteip_input_filter, NULL,
+                                 AP_FTYPE_CONNECTION + 7);
+
+    ap_hook_pre_config(remoteip_hook_pre_config, NULL, NULL, APR_HOOK_MIDDLE);
+    ap_hook_post_config(remoteip_hook_post_config, NULL, NULL, APR_HOOK_MIDDLE);
+    ap_hook_pre_connection(remoteip_hook_pre_connection, NULL, NULL, APR_HOOK_MIDDLE);
     ap_hook_post_read_request(remoteip_modify_request, NULL, NULL, APR_HOOK_FIRST);
+    ap_hook_http_scheme(remoteip_http_scheme, NULL, NULL, APR_HOOK_FIRST);
+    ap_hook_default_port(remoteip_default_port, NULL, NULL, APR_HOOK_FIRST);
+
+    APR_REGISTER_OPTIONAL_FN(remote_is_https);
 }
 
 AP_DECLARE_MODULE(remoteip) = {

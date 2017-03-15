@@ -97,6 +97,7 @@
 #include "util_mutex.h"
 
 #include "mod_ssl.h"
+#include "../metadata/mod_remoteip.h"
 
 #include "mod_rewrite.h"
 #include "ap_expr.h"
@@ -417,6 +418,7 @@ static const char *rewritemap_mutex_type = "rewrite-map";
 /* Optional functions imported from mod_ssl when loaded: */
 static APR_OPTIONAL_FN_TYPE(ssl_var_lookup) *rewrite_ssl_lookup = NULL;
 static APR_OPTIONAL_FN_TYPE(ssl_is_https) *rewrite_is_https = NULL;
+static APR_OPTIONAL_FN_TYPE(remote_is_https) *rewrite_remote_is_https = NULL;
 static char *escape_uri(apr_pool_t *p, const char *path);
 
 /*
@@ -1923,7 +1925,8 @@ static char *lookup_variable(char *var, rewrite_ctx *ctx)
 
         case  5:
             if (!strcmp(var, "HTTPS")) {
-                int flag = rewrite_is_https && rewrite_is_https(r->connection);
+                int flag = (rewrite_is_https && rewrite_is_https(r->connection)) ||
+                        (rewrite_remote_is_https && rewrite_remote_is_https(r->connection));
                 return apr_pstrdup(r->pool, flag ? "on" : "off");
             }
             break;
@@ -4462,6 +4465,7 @@ static int post_config(apr_pool_t *p,
 
     rewrite_ssl_lookup = APR_RETRIEVE_OPTIONAL_FN(ssl_var_lookup);
     rewrite_is_https = APR_RETRIEVE_OPTIONAL_FN(ssl_is_https);
+    rewrite_remote_is_https = APR_RETRIEVE_OPTIONAL_FN(remote_is_https);
 
     return OK;
 }

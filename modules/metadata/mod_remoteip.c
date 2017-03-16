@@ -115,6 +115,18 @@ typedef union {
         proxy_v2 v2;
 } proxy_header;
 
+typedef struct pp2_tlv {
+    uint8_t type;
+    uint8_t length_hi;
+    uint8_t length_lo;
+    uint8_t value[];
+} pp2_tlv;
+
+typedef struct pp2_tlv_ssl {
+    uint8_t  client;
+    uint32_t verify;
+} pp2_tlv_ssl;
+
 static const char v2sig[12] = "\x0D\x0A\x0D\x0A\x00\x0D\x0A\x51\x55\x49\x54\x0A";
 #define MIN_V1_HDR_LEN 15
 #define MIN_V2_HDR_LEN 16
@@ -903,9 +915,33 @@ static int remoteip_hook_pre_connection(conn_rec *c, void *csd)
     /* this holds the resolved proxy info for this connection */
     conn_conf = apr_pcalloc(c->pool, sizeof(*conn_conf));
 
+    conn_conf->remoteip_is_ssl = 0;
+
     ap_set_module_config(c->conn_config, &remoteip_module, conn_conf);
 
     return OK;
+}
+
+#define PP2_TYPE_SSL            0x20
+#define PP2_SUBTYPE_SSL_VERSION 0x21
+#define PP2_SUBTYPE_SSL_CN      0x22
+
+#define PP2_CLIENT_SSL           0x01
+#define PP2_CLIENT_CERT_CONN     0x02
+#define PP2_CLIENT_CERT_SESS     0x04
+
+/** Return length for a v2 protocol header. */
+static int remoteip_get_v2_len(proxy_header *hdr)
+{
+    return ntohs(hdr->v2.len);
+}
+
+/*
+ * Get data length from tlv
+ */
+static int get_tlv_length(const struct pp2_tlv *src)
+{
+    return (src->length_hi << 8) | src->length_lo;
 }
 
 /* Binary format:
@@ -920,9 +956,14 @@ static int remoteip_hook_pre_connection(conn_rec *c, void *csd)
  */
 static remoteip_parse_status_t remoteip_process_v2_header(conn_rec *c,
                                               remoteip_conn_config_t *conn_conf,
-                                              proxy_header *hdr)
+                                              const char *ptr, apr_size_t len)
 {
+    proxy_header *hdr = (proxy_header *) ptr;
     apr_status_t ret;
+    int tlv_length = 0;
+    int tlv_offset = 0;
+    ap_log_cerror(APLOG_MARK, APLOG_DEBUG, 0, c,
+               "RemoteIPProxyProtocol: data_size, %d" , remoteip_get_v2_len(hdr));
 
     switch (hdr->v2.ver_cmd & 0xF) {
         case 0x01: /* PROXY command */
@@ -941,6 +982,8 @@ static remoteip_parse_status_t remoteip_process_v2_header(conn_rec *c,
 
                     conn_conf->client_addr->sa.sin.sin_addr.s_addr =
                             hdr->v2.addr.ip4.src_addr;
+                    tlv_offset = MIN_V2_HDR_LEN + 12;
+                    tlv_length = remoteip_get_v2_len(hdr) - 12;
                     break;
 
                 case 0x21:  /* TCPv6 */
@@ -957,6 +1000,8 @@ static remoteip_parse_status_t remoteip_process_v2_header(conn_rec *c,
                     }
                     memcpy(&conn_conf->client_addr->sa.sin6.sin6_addr.s6_addr,
                            hdr->v2.addr.ip6.src_addr, 16);
+                    tlv_offset = MIN_V2_HDR_LEN + 36;
+                    tlv_length = remoteip_get_v2_len(hdr) - 36;
                     break;
 #else
                     ap_log_cerror(APLOG_MARK, APLOG_ERR, 0, c, APLOGNO(03506)
@@ -990,13 +1035,40 @@ static remoteip_parse_status_t remoteip_process_v2_header(conn_rec *c,
         return HDR_ERROR;
     }
 
-    return HDR_DONE;
-}
+    if (tlv_length > 0) {
+        /* we have extra data, let's see if it has SSL info */
+        while (tlv_offset + 3  <= len) {
+            const struct pp2_tlv *tlv_packet = (struct pp2_tlv *) &ptr[tlv_offset];
+            const int tlv_len = get_tlv_length(tlv_packet);
+            tlv_offset += tlv_len + 3;
 
-/** Return length for a v2 protocol header. */
-static apr_size_t remoteip_get_v2_len(proxy_header *hdr)
-{
-    return ntohs(hdr->v2.len);
+            ap_log_cerror(APLOG_MARK, APLOG_DEBUG, 0, c,
+		    "RemoteIPProxyProtocol: tlv,  length %d, type %x", tlv_len, (unsigned)tlv_packet->type);
+            if (tlv_packet->type == PP2_TYPE_SSL) {
+                pp2_tlv_ssl tssl;
+                if (tlv_len < 5) {
+                    ap_log_cerror(APLOG_MARK, APLOG_INFO, 0, c,
+                        "RemoteIPProxyProtocol: TLV SSL header size is invalid");
+                    continue;
+                }
+                memcpy(&tssl.client, tlv_packet->value, 1);
+                memcpy(&tssl.verify, tlv_packet->value + 1, 4);
+                if (tssl.client & PP2_CLIENT_SSL) {
+                    ap_log_cerror(APLOG_MARK, APLOG_DEBUG, 0, c,
+                        "RemoteIPProxyProtocol: received SSL is enabled");
+                    conn_conf->remoteip_is_ssl = 1;
+                }
+                tlv_offset -= tlv_len - 5;
+            } else if (tlv_packet->type == PP2_SUBTYPE_SSL_VERSION) {
+                char ssl_ver[tlv_len];
+                memcpy(&ssl_ver, tlv_packet->value, tlv_len);
+                ap_log_cerror(APLOG_MARK, APLOG_DEBUG, 0, c,
+                    "RemoteIPProxyProtocol: received SSL version %s", ssl_ver);
+            }
+        }
+    }
+
+    return HDR_DONE;
 }
 
 /** Determine if this is a v1 or v2 PROXY header.
@@ -1119,7 +1191,7 @@ static apr_status_t remoteip_input_filter(ap_filter_t *f,
                 }
                 if (ctx->rcvd >= ctx->need) {
                     psts = remoteip_process_v2_header(f->c, conn_conf,
-                                                (proxy_header *) ctx->header);
+                                                ctx->header, ctx->rcvd);
                 }
             }
             else {

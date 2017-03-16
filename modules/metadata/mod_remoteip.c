@@ -498,8 +498,12 @@ static int remoteip_modify_request(request_rec *r)
     conn_rec *c = r->connection;
     remoteip_config_t *config = (remoteip_config_t *)
         ap_get_module_config(r->server->module_config, &remoteip_module);
-    remoteip_conn_config_t *conn_config = (remoteip_conn_config_t *)
-        ap_get_module_config(r->connection->conn_config, &remoteip_module);
+    remoteip_conn_config_t *conn_config;
+    if (c->master != NULL) {
+        conn_config = (remoteip_conn_config_t *) ap_get_module_config(c->master->conn_config, &remoteip_module);
+    } else {
+        conn_config = (remoteip_conn_config_t *) ap_get_module_config(c->conn_config, &remoteip_module);
+    }
 
     remoteip_req_t *req = NULL;
     apr_sockaddr_t *temp_sa;

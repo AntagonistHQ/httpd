@@ -31,6 +31,7 @@
 #define APR_WANT_BYTEFUNC
 #include "apr_want.h"
 #include "apr_network_io.h"
+#include "mod_remoteip.h"
 
 module AP_MODULE_DECLARE_DATA remoteip_module;
 
@@ -64,6 +65,12 @@ typedef struct {
     remoteip_addr_info *proxy_protocol_disabled;
 
     apr_array_header_t *disabled_subnets;
+
+    /*** Flag indicating if apache should treat the connection as ssl
+     * if remote says so
+     */
+    int use_remote_ssl;
+
     apr_pool_t *pool;
 } remoteip_config_t;
 
@@ -157,9 +164,53 @@ typedef struct {
     apr_sockaddr_t *client_addr;
     /** Character representation of the client */
     char *client_ip;
+    /*** Flag indicating that remote connection used ssl */
+    int remoteip_is_ssl;
+
 } remoteip_conn_config_t;
 
 typedef enum { HDR_DONE, HDR_ERROR, HDR_NEED_MORE } remoteip_parse_status_t;
+
+static int remote_is_https(conn_rec *c)
+{
+    remoteip_config_t *config;
+    remoteip_conn_config_t *conn_conf;
+    config = ap_get_module_config(ap_server_conf->module_config,
+                                &remoteip_module);
+    if (c->master != NULL) {
+        conn_conf = ap_get_module_config(c->master->conn_config, &remoteip_module);
+    } else {
+        conn_conf = ap_get_module_config(c->conn_config, &remoteip_module);
+    }
+    if (conn_conf && conn_conf->remoteip_is_ssl) {
+        ap_log_cerror(APLOG_MARK, APLOG_DEBUG, 0, c,
+                  "ProxyProtocol: remote ssl on port %hu",
+                  c->local_addr->port);
+        return 1;
+    } else {
+        ap_log_cerror(APLOG_MARK, APLOG_DEBUG, 0, c,
+                  "ProxyProtocol: no remote ssl on port %hu",
+                  c->local_addr->port);
+        return 0;
+    }
+}
+
+static const char *remoteip_http_scheme(const request_rec *r)
+{
+    if (remote_is_https(r->connection)) {
+        return "https";
+    }
+    return NULL;
+}
+
+static apr_port_t remoteip_default_port(const request_rec *r)
+{
+    if (remote_is_https(r->connection)) {
+        return 443;
+    }
+    return 0;
+}
+
 
 static void *create_remoteip_server_config(apr_pool_t *p, server_rec *s)
 {
@@ -170,6 +221,7 @@ static void *create_remoteip_server_config(apr_pool_t *p, server_rec *s)
      * config->proxy_protocol_enabled = NULL;
      * config->proxy_protocol_disabled = NULL;
      */
+    config->use_remote_ssl = 0;
     config->pool = p;
     return config;
 }
@@ -191,6 +243,9 @@ static void *merge_remoteip_server_config(apr_pool_t *p, void *globalv,
     config->proxymatch_ip = server->proxymatch_ip
                           ? server->proxymatch_ip
                           : global->proxymatch_ip;
+    config->use_remote_ssl = server->use_remote_ssl
+                          ? server->use_remote_ssl
+                          : global->use_remote_ssl;
     return config;
 }
 
@@ -517,6 +572,7 @@ static int remoteip_modify_request(request_rec *r)
         conn_config = (remoteip_conn_config_t *) ap_get_module_config(c->conn_config, &remoteip_module);
     }
 
+    apr_table_t *env = r->subprocess_env;
     remoteip_req_t *req = NULL;
     apr_sockaddr_t *temp_sa;
 
@@ -550,6 +606,9 @@ static int remoteip_modify_request(request_rec *r)
 
         r->useragent_addr = conn_config->client_addr;
         r->useragent_ip = conn_config->client_ip;
+        if (remote_is_https(c)) {
+            apr_table_setn(env, "HTTPS", "on");
+        }
 
         ap_log_rerror(APLOG_MARK, APLOG_TRACE1, 0, r,
                       "Using %s as client's IP from PROXY protocol", r->useragent_ip);
@@ -962,6 +1021,8 @@ static remoteip_parse_status_t remoteip_process_v2_header(conn_rec *c,
     apr_status_t ret;
     int tlv_length = 0;
     int tlv_offset = 0;
+    remoteip_config_t *config = ap_get_module_config(ap_server_conf->module_config,
+                                                     &remoteip_module);
     ap_log_cerror(APLOG_MARK, APLOG_DEBUG, 0, c,
                "RemoteIPProxyProtocol: data_size, %d" , remoteip_get_v2_len(hdr));
 
@@ -1035,7 +1096,7 @@ static remoteip_parse_status_t remoteip_process_v2_header(conn_rec *c,
         return HDR_ERROR;
     }
 
-    if (tlv_length > 0) {
+    if (tlv_length > 0 && config->use_remote_ssl) {
         /* we have extra data, let's see if it has SSL info */
         while (tlv_offset + 3  <= len) {
             const struct pp2_tlv *tlv_packet = (struct pp2_tlv *) &ptr[tlv_offset];
@@ -1090,6 +1151,16 @@ static int remoteip_determine_version(conn_rec *c, const char *ptr)
         return -1;
     }
 }
+
+static const char *remoteip_use_remote_ssl(cmd_parms *cmd,
+                                 void *dconf, int use_ssl_on)
+{
+    remoteip_config_t *config = ap_get_module_config(cmd->server->module_config,
+                                                     &remoteip_module);
+    config->use_remote_ssl = use_ssl_on;
+    return NULL;
+}
+
 
 /* Capture the first bytes on the protocol and parse the PROXY protocol header.
  * Removes itself when the header is complete.
@@ -1270,6 +1341,9 @@ static const command_rec remoteip_cmds[] =
     AP_INIT_TAKE_ARGV("RemoteIPProxyProtocolExceptions",
                   remoteip_disable_networks, NULL, RSRC_CONF, "Disable PROXY "
                   "protocol handling for this list of networks in CIDR format"),
+    AP_INIT_FLAG("RemoteIPUseRemoteSSL", remoteip_use_remote_ssl, NULL, RSRC_CONF,
+                  "Specifies that conenction should be handled as SSL when remote says so"),
+
     { NULL }
 };
 
@@ -1285,6 +1359,10 @@ static void register_hooks(apr_pool_t *p)
     ap_hook_post_config(remoteip_hook_post_config, NULL, NULL, APR_HOOK_MIDDLE);
     ap_hook_pre_connection(remoteip_hook_pre_connection, NULL, NULL, APR_HOOK_MIDDLE);
     ap_hook_post_read_request(remoteip_modify_request, NULL, NULL, APR_HOOK_FIRST);
+    ap_hook_http_scheme(remoteip_http_scheme, NULL, NULL, APR_HOOK_FIRST);
+    ap_hook_default_port(remoteip_default_port, NULL, NULL, APR_HOOK_FIRST);
+
+    APR_REGISTER_OPTIONAL_FN(remote_is_https);
 }
 
 AP_DECLARE_MODULE(remoteip) = {
